@@ -7,12 +7,14 @@ import android.graphics.*
 import android.graphics.drawable.GradientDrawable
 import android.media.AudioManager
 import android.os.*
+import android.speech.tts.TextToSpeech
 import android.view.*
 import android.widget.*
 import androidx.core.app.NotificationCompat
 import org.json.JSONArray
 import java.io.BufferedReader
 import java.io.InputStreamReader
+import java.util.Locale
 
 class QuizGuardService : Service() {
 
@@ -22,6 +24,9 @@ class QuizGuardService : Service() {
     private var questionsList = JSONArray()
     private var currentIndex = 0
     private var wrongCount = 0
+
+    private var tts: TextToSpeech? = null
+    private var isTtsReady = false
 
     private val WATCH_INTERVAL_MS = 5 * 60 * 1000L
     private val LOCKOUT_DURATION_MS = 15 * 60 * 1000L
@@ -38,9 +43,35 @@ class QuizGuardService : Service() {
     override fun onCreate() {
         super.onCreate()
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
+        initTextToSpeech()
         loadQuestions()
         startForegroundNotification()
         scheduleNextQuiz(WATCH_INTERVAL_MS)
+    }
+
+    private fun initTextToSpeech() {
+        tts = TextToSpeech(this) { status ->
+            if (status == TextToSpeech.SUCCESS) {
+                val arLocale = Locale("ar")
+                val res = tts?.setLanguage(arLocale)
+                if (res == TextToSpeech.LANG_MISSING_DATA || res == TextToSpeech.LANG_NOT_SUPPORTED) {
+                    tts?.language = Locale.getDefault()
+                }
+                tts?.setSpeechRate(0.95f)
+                isTtsReady = true
+            }
+        }
+    }
+
+    private fun speakError(spokenText: String) {
+        if (isTtsReady) {
+            tts?.stop()
+            tts?.speak(spokenText, TextToSpeech.QUEUE_FLUSH, null, "error_feedback")
+        }
+    }
+
+    private fun stopSpeaking() {
+        tts?.stop()
     }
 
     private fun startForegroundNotification() {
@@ -127,6 +158,7 @@ class QuizGuardService : Service() {
     }
 
     private fun buildQuestionUI(root: LinearLayout) {
+        stopSpeaking()
         root.removeAllViews()
         val prefs = getSharedPreferences("GuardPrefs", Context.MODE_PRIVATE)
 
@@ -176,9 +208,14 @@ class QuizGuardService : Service() {
 
         val tvFeedback = TextView(this).apply {
             textSize = 16f
-            setTextColor(Color.parseColor("#D32F2F"))
+            setTextColor(Color.parseColor("#C62828"))
             gravity = Gravity.CENTER
-            setPadding(16, 20, 16, 20)
+            setPadding(20, 20, 20, 20)
+            background = GradientDrawable().apply {
+                setColor(Color.parseColor("#FFEBEE"))
+                cornerRadius = 24f
+                setStroke(2, Color.parseColor("#EF9A9A"))
+            }
             visibility = View.GONE
         }
 
@@ -187,7 +224,9 @@ class QuizGuardService : Service() {
         root.addView(visualCard)
         root.addView(tvFeedback)
 
+        val optionButtons = mutableListOf<Button>()
         val labels = listOf("أ", "ب", "ج")
+
         for (i in 0 until options.length()) {
             val btn = Button(this).apply {
                 text = "${labels[i]})  ${options.getString(i)}"
@@ -210,6 +249,7 @@ class QuizGuardService : Service() {
                     prefs.edit().putInt("q_index", currentIndex).apply()
 
                     if (i == correctIndex) {
+                        stopSpeaking()
                         Toast.makeText(this@QuizGuardService, "أحسنت! إجابة صحيحة 🎉 استمتع بـ 5 دقائق", Toast.LENGTH_SHORT).show()
                         removeOverlay()
                         scheduleNextQuiz(WATCH_INTERVAL_MS)
@@ -220,18 +260,66 @@ class QuizGuardService : Service() {
                         if (wrongCount >= 5) {
                             val lockUntilTime = System.currentTimeMillis() + LOCKOUT_DURATION_MS
                             prefs.edit().putLong("lock_until", lockUntilTime).apply()
+                            speakError("لقد أخطأت في 5 أسئلة. سيتوقف الهاتف لمدة 15 دقيقة لمراجعة $pageRef")
                             buildLockoutUI(root, LOCKOUT_DURATION_MS, pageRef)
                         } else {
                             val correctText = options.getString(correctIndex)
-                            tvFeedback.text = "❌ إجابة خاطئة!\nالصحيح هو: ($correctText)\n💡 $explanation\n📖 راجع: $pageRef\nجاري تحميل سؤال آخر..."
+                            tvFeedback.text = "❌ إجابة خاطئة!\nالصحيح هو: ($correctText)\n💡 $explanation\n📖 راجع: $pageRef"
                             tvFeedback.visibility = View.VISIBLE
-                            handler.postDelayed({
-                                if (overlayView != null) buildQuestionUI(root)
-                            }, 3500)
+
+                            // قفل أزرار الاختيارات أثناء مراجعة الخطأ وعدم الانتقال تلقائياً
+                            optionButtons.forEach { b -> b.isEnabled = false }
+
+                            speakError("إجابة خاطئة. الإجابة الصحيحة هي $correctText. $explanation. راجع $pageRef")
+
+                            val btnRetry = Button(this@QuizGuardService).apply {
+                                text = "حاول تاني 🔄"
+                                textSize = 19f
+                                setTypeface(null, Typeface.BOLD)
+                                setTextColor(Color.WHITE)
+                                val lpBtn = LinearLayout.LayoutParams(
+                                    LinearLayout.LayoutParams.MATCH_PARENT,
+                                    LinearLayout.LayoutParams.WRAP_CONTENT
+                                ).apply { setMargins(0, 20, 0, 8) }
+                                layoutParams = lpBtn
+                                setPadding(24, 24, 24, 24)
+                                background = GradientDrawable().apply {
+                                    setColor(Color.parseColor("#1565C0"))
+                                    cornerRadius = 24f
+                                }
+                                setOnClickListener {
+                                    stopSpeaking()
+                                    if (overlayView != null) buildQuestionUI(root)
+                                }
+                            }
+
+                            val btnRepeatVoice = Button(this@QuizGuardService).apply {
+                                text = "🔊 اسمع الشرح تاني"
+                                textSize = 16f
+                                setTextColor(Color.parseColor("#1565C0"))
+                                val lpSpeak = LinearLayout.LayoutParams(
+                                    LinearLayout.LayoutParams.MATCH_PARENT,
+                                    LinearLayout.LayoutParams.WRAP_CONTENT
+                                ).apply { setMargins(0, 8, 0, 8) }
+                                layoutParams = lpSpeak
+                                setPadding(18, 18, 18, 18)
+                                background = GradientDrawable().apply {
+                                    setColor(Color.parseColor("#E3F2FD"))
+                                    cornerRadius = 20f
+                                    setStroke(2, Color.parseColor("#90CAF9"))
+                                }
+                                setOnClickListener {
+                                    speakError("الإجابة الصحيحة هي $correctText. $explanation. راجع $pageRef")
+                                }
+                            }
+
+                            root.addView(btnRetry)
+                            root.addView(btnRepeatVoice)
                         }
                     }
                 }
             }
+            optionButtons.add(btn)
             root.addView(btn)
         }
     }
@@ -294,6 +382,7 @@ class QuizGuardService : Service() {
     }
 
     private fun removeOverlay() {
+        stopSpeaking()
         overlayView?.let {
             windowManager.removeView(it)
             overlayView = null
@@ -304,6 +393,9 @@ class QuizGuardService : Service() {
         super.onDestroy()
         removeOverlay()
         handler.removeCallbacks(showQuizRunnable)
+        tts?.stop()
+        tts?.shutdown()
+        tts = null
     }
 
     override fun onBind(intent: Intent?) = null
